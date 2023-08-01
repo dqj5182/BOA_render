@@ -485,7 +485,7 @@ class Adaptator():
         # Render info
         render_result_path = './render_result_openpose'
         render_color = np.array([135, 108, 250])
-        gray_render_color = np.array([190, 190, 190])
+        gray_render_color = np.array([220, 220, 220])
 
         # Data loading
         imgname = img_info['imgname'][0]
