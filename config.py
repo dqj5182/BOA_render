@@ -4,9 +4,9 @@ import os.path as osp
 SMPL_MODEL_DIR = 'data/smpl'
 SMPL_MEAN_PARAMS = 'data/spin_data/smpl_mean_params.npz'
 
-PW3D_ROOT = 'path_to_3dpw'
-MPI_INF_3DHP_ROOT = 'path_to_mpi-inf-3dhp'
-H36M_ROOT = 'path_to_human36m'
+PW3D_ROOT = '/mnt/disk3/danieljung0121/3DPW_Original'
+MPI_INF_3DHP_ROOT = '/mnt/disk3/danieljung0121/MPI_INF_3DHP'
+H36M_ROOT = '/mnt/disk1/danieljung0121/Human36M'
 
 # folder to save processed files
 DATASET_NPZ_PATH = 'data/dataset_extras'

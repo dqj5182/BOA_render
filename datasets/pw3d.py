@@ -14,6 +14,11 @@ import config
 import constants
 from utils.imutils import crop, flip_img, flip_pose, flip_kp, transform, rot_aa
 
+def key_3dpw(elem):
+    elem = os.path.basename(elem)
+    vid = elem.split('_')[1]
+    pid = elem.split('_')[2][:-4]
+    return int(vid)*10+int(pid)
 
 IMG_DIR = config.PW3D_ROOT
 class PW3D(Dataset):
@@ -24,8 +29,14 @@ class PW3D(Dataset):
         self.img_dir = IMG_DIR
         self.normalize_img = Normalize(mean=constants.IMG_NORM_MEAN, std=constants.IMG_NORM_STD)
 
+        self.load_dynaboa_3dpw = True
+
         # load data
-        annotfiles = [os.path.join(config.PW3D_ANNOT_DIR, x+'.npz') for x in constants.pw3d_annot_names]
+        if self.load_dynaboa_3dpw is True:
+            annotfiles = glob.glob('data/dataset_extras/3dpw_vid_dynaboa/3dpw_[0-9]*_[0-9].npz')
+            annotfiles.sort(key=key_3dpw)
+        else:
+            annotfiles = [os.path.join(config.PW3D_ANNOT_DIR, x+'.npz') for x in constants.pw3d_annot_names]
         self.scales = []
         self.centers = []
         self.s2ds = []
@@ -36,22 +47,39 @@ class PW3D(Dataset):
         self.genders = []
         self.totallength = 0
         self.video_flags = []
+        self.p_ids = []
 
         for fileidx, annotfile in enumerate(annotfiles):
             targetscene_name = os.path.basename(annotfile)[:-4]
             data = np.load(annotfile)
-            imgnames = data['imgname']
-            scale = data['scale']
-            center = data['center']
-            theta = data['pose'].astype(np.float)
-            beta = data['shape'].astype(np.float)
-            s2ds_smpl = data['smpl_j2d']
-            s2ds_gt = data['part']
-            s2ds_openpose = np.zeros((len(imgnames), 25, 3))
-            s2ds_all = np.concatenate([s2ds_openpose, s2ds_gt], axis=1)
-            gender = data['gender']
-            gender = np.array([0 if str(g) == 'm' else 1 for g in gender]).astype(np.int32)
-            length = scale.shape[0]
+            if self.load_dynaboa_3dpw is True:
+                imgnames = data['imgname']
+                scale = data['scale']
+                center = data['center']
+                theta = data['pose'].astype(np.float)
+                beta = data['shape'].astype(np.float)
+                #s2ds_smpl = data['j2d']
+                s2ds_smpl = data['op_j2d']
+                s2ds_gt = data['op_j2d']
+                s2ds_openpose = np.zeros((len(imgnames), 25, 3))
+                s2ds_all = np.concatenate([s2ds_openpose, s2ds_gt], axis=1)
+                gender = data['gender']
+                gender = np.array([0 if str(g) == 'm' else 1 for g in gender]).astype(np.int32)
+                length = scale.shape[0]
+                p_id = np.repeat(fileidx, len(imgnames))
+            else:
+                imgnames = data['imgname']
+                scale = data['scale']
+                center = data['center']
+                theta = data['pose'].astype(np.float)
+                beta = data['shape'].astype(np.float)
+                s2ds_smpl = data['smpl_j2d']
+                s2ds_gt = data['part']
+                s2ds_openpose = np.zeros((len(imgnames), 25, 3))
+                s2ds_all = np.concatenate([s2ds_openpose, s2ds_gt], axis=1)
+                gender = data['gender']
+                gender = np.array([0 if str(g) == 'm' else 1 for g in gender]).astype(np.int32)
+                length = scale.shape[0]
             self.totallength += length
             self.scales.append(scale)
             self.centers.append(center)
@@ -61,6 +89,7 @@ class PW3D(Dataset):
             self.s2ds_smpl.append(s2ds_smpl)
             self.s2ds.append(s2ds_all)
             self.genders.append(gender)
+            self.p_ids.append(p_id)
             vf = [fileidx]*length
             vf[-1] = -1000    # represent the end of the video
             vf[0] = -2000     # represent the start of the video
@@ -77,6 +106,7 @@ class PW3D(Dataset):
         self.s2ds_smpl = np.concatenate(self.s2ds_smpl)
         self.s2ds = np.concatenate(self.s2ds)
         self.genders = np.concatenate(self.genders)
+        self.p_ids = np.concatenate(self.p_ids)
 
     def __getitem__(self, index):
         item = {}
@@ -89,6 +119,7 @@ class PW3D(Dataset):
         imgname = self.imgnames[index].copy()
         s2d_smpl = self.s2ds_smpl[index].copy()
         gender = self.genders[index].copy()
+        p_id = self.p_ids[index].copy()
         video_flag = self.video_flags[index].copy()
 
         image = self.read_image(imgname)
@@ -104,6 +135,7 @@ class PW3D(Dataset):
                                                                           center, 
                                                                           scale, 
                                                                           flip, pn, rot, sc, is_train=False)
+        item['img_process'] = {'imgname': imgname, 'theta': theta, 'beta': beta, 's2d': s2d, 's2d_smpl': s2d_smpl, 'center': center, 'scale': scale, 'p_id': p_id}         
         item['keypoint'] = s2d
         item['image'] = image
         item['pose'] = theta

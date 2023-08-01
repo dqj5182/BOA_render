@@ -23,10 +23,11 @@ from models.hmr import hmr
 from datasets.pw3d import PW3D
 from datasets.h36 import H36M
 from datasets.mpi_3dhp import HP3D
-from utils.smpl import SMPL
+from utils.smpl import SMPL, get_smpl_faces
 from utils.pose_utils import reconstruction_error
 from utils.geometry import perspective_projection, rotation_matrix_to_angle_axis, estimate_translation, batch_rodrigues
 from utils.losses import *
+from utils.render_demo import Renderer
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--expdir', type=str, default='experiments', help='common dir of each experiment')
@@ -63,9 +64,9 @@ parser.add_argument('--motionloss_weight', type=float, default=0.1)
 # predefined variables
 device = torch.device('cuda')
 J_regressor = torch.from_numpy(np.load(config.JOINT_REGRESSOR_H36M)).float()
-smpl_neutral = SMPL(config.SMPL_MODEL_DIR, create_transl=False).to(device)
-smpl_male = SMPL(config.SMPL_MODEL_DIR, gender='male', create_transl=False).to(device)
-smpl_female = SMPL(config.SMPL_MODEL_DIR, gender='female', create_transl=False).to(device)
+smpl_neutral = SMPL(config.SMPL_MODEL_DIR, batch_size=1, create_transl=False).to(device)
+smpl_male = SMPL(config.SMPL_MODEL_DIR, gender='male', batch_size=1, create_transl=False).to(device)
+smpl_female = SMPL(config.SMPL_MODEL_DIR, gender='female', batch_size=1, create_transl=False).to(device)
 # -- end
 
 # mean teacher help functions
@@ -147,7 +148,8 @@ class Adaptator():
         if '3dpw' in self.options.dataset_name:
             # 3dpw
             self.pw3d_dataset = PW3D(self.options, '3dpw')
-            self.pw3d_dataloader = DataLoader(self.pw3d_dataset, batch_size=self.options.batch_size, shuffle=False, num_workers=16)
+            self.pw3d_dataloader = DataLoader(self.pw3d_dataset, batch_size=self.options.batch_size, shuffle=False, num_workers=0)
+            #self.pw3d_dataloader = DataLoader(self.pw3d_dataset, batch_size=self.options.batch_size, shuffle=False, num_workers=16)
         elif 'mpi-inf' in self.options.dataset_name:
             # 3DHP
             self.pw3d_dataset = HP3D(self.options, 'mpi-inf-3dhp')
@@ -414,6 +416,43 @@ class Adaptator():
                 unposed_gt_vertices = smpl_male(global_orient=t_rotmat[:,1:], body_pose=t_rotmat[:,0].unsqueeze(1), betas=gt_betas, pose2rot=False).vertices 
                 unposed_gt_vertices_female = smpl_female(global_orient=t_rotmat[:,1:], body_pose=t_rotmat[:,0].unsqueeze(1), betas=gt_betas, pose2rot=False).vertices 
                 unposed_gt_vertices[gender==1, :, :] = unposed_gt_vertices_female[gender==1, :, :]
+
+            # Get 14 predicted joints from the mesh
+            pred_keypoints_3d_orig = torch.matmul(J_regressor_batch, pred_vts)
+            pred_pelvis = pred_keypoints_3d_orig[:, [0], :].clone()
+            pred_keypoints_3d_orig = pred_keypoints_3d_orig[:, joint_mapper_h36m, :]
+            pred_keypoints_3d = pred_keypoints_3d_orig - pred_pelvis
+
+            cached_results = {'imgname': databatch['imgname'][0],
+                                'img_process': databatch['img_process'],
+                                #'p_id': p_id.cpu().numpy(),
+                                'verts': pred_vts.cpu().numpy(),
+                                #'pred_cam_t': pred_cam_t.cpu().numpy(),
+                                'pred_cam': pred_cam.cpu().numpy(),
+                                #'bbox': batch['bbox'],
+                                'rotmat': pred_rotmat.cpu().numpy(),
+                                'beta': pred_betas.cpu().numpy(),
+                                'gt_keypoints_3d': gt_keypoints_3d.cpu().numpy(),
+                                'pred_keypoints_3d_orig': pred_keypoints_3d_orig.cpu().numpy(),
+                                'pred_keypoints_3d': pred_keypoints_3d.cpu().numpy()}
+
+
+            # Render mesh to image
+            self.render_output_mesh(cached_results['img_process'], cached_results['verts'], cached_results['pred_cam'], pred_pelvis.detach().cpu().numpy())
+
+            # Save mesh render result
+            seq_name = databatch['imgname'][0].split('/')[1]
+            image_id = databatch['imgname'][0].split('/')[-1].split('image_')[-1].split('.')[0]
+            
+            """
+            if not os.path.exists(os.path.join(self.exppath, 'result', seq_name)):
+                os.makedirs(os.path.join(self.exppath, 'result', seq_name))
+
+            joblib.dump(cached_results, osp.join(self.exppath, 'front', seq_name, f'image_{image_id}.pt'))
+            """
+
+
+
             # Get 14 predicted joints from the mesh
             pred_keypoints_3d = torch.matmul(J_regressor_batch, pred_vts)
             pred_pelvis = pred_keypoints_3d[:, [0], :].clone()
@@ -440,6 +479,137 @@ class Adaptator():
         else:
             hist_uimage, hist_us2d = None, None
         return {'image': hist_uimage, 's2d': hist_us2d}
+
+
+    def render_output_mesh(self, img_info, verts, pred_cam, pred_pelvis):
+        # Render info
+        render_result_path = './render_result_openpose'
+        render_color = np.array([135, 108, 250])
+        gray_render_color = np.array([190, 190, 190])
+
+        # Data loading
+        imgname = img_info['imgname'][0]
+        img_id = int(imgname.split('/')[-1].split('.jpg')[0].split('image_')[-1])
+        theta = img_info['theta']
+        beta = img_info['beta']
+        s2d = img_info['s2d']
+        s2d_smpl = img_info['s2d_smpl']
+        center = img_info['center'][0]
+        scale = img_info['scale'][0]
+        p_id = img_info['p_id'][0].item()
+
+        seq_name = imgname.split('/')[-2] + '_' + str(p_id)
+
+        pred_verts = verts
+        pred_verts_root = pred_verts - pred_pelvis
+        pred_cam = pred_cam
+        
+        # Rendering
+        oriimg = cv2.imread(os.path.join(config.PW3D_ROOT, imgname))
+        ori_h, ori_w = oriimg.shape[:2]
+        bbox = np.array([[center[0].item(), center[1].item(), 200*scale]])
+        ori_pred_cams = convert_crop_cam_to_orig_img(pred_cam, bbox, ori_w, ori_h)
+        # Front
+        renderer = Renderer(resolution=(ori_w, ori_h), orig_img=True, wireframe=False)
+        rendered_image = renderer.render(oriimg, pred_verts[0], ori_pred_cams[0], color=render_color/255, mesh_filename='demo.obj')
+        gray_rendered_image = renderer.render(oriimg, pred_verts[0], ori_pred_cams[0], color=gray_render_color/255, mesh_filename='demo.obj')
+        # Side
+        white_background = 255 * np.ones((ori_h,ori_w,3), np.uint8)
+        black_background = np.zeros((ori_h,ori_w,3), np.uint8)
+        side_rendered_image = renderer.render(white_background, pred_verts[0], ori_pred_cams[0], color=render_color/255, mesh_filename='demo.obj', angle=-90, axis=[0,1,0])
+        gray_side_rendered_image = renderer.render(white_background, pred_verts[0], ori_pred_cams[0], color=gray_render_color/255, mesh_filename='demo.obj', angle=-90, axis=[0,1,0])
+
+        # Front view
+        front_view_path = os.path.join(render_result_path, 'front', seq_name)
+        gray_front_view_path = os.path.join(render_result_path, 'front_gray', seq_name)
+        if not os.path.exists(front_view_path):
+            os.makedirs(front_view_path)
+        if not os.path.exists(gray_front_view_path):
+            os.makedirs(gray_front_view_path)
+        cv2.imwrite(os.path.join(front_view_path, f'{img_id:05d}.png'), rendered_image)
+        cv2.imwrite(os.path.join(gray_front_view_path, f'{img_id:05d}.png'), gray_rendered_image)
+
+        # Side view
+        side_view_path = os.path.join(render_result_path, 'side', seq_name)
+        gray_side_view_path = os.path.join(render_result_path, 'side_gray', seq_name)
+        if not os.path.exists(side_view_path):
+            os.makedirs(side_view_path)
+        if not os.path.exists(gray_side_view_path):
+            os.makedirs(gray_side_view_path)
+        cv2.imwrite(os.path.join(side_view_path, f'{img_id:05d}.png'), side_rendered_image)
+        cv2.imwrite(os.path.join(gray_side_view_path, f'{img_id:05d}.png'), gray_side_rendered_image)
+
+        # Mesh obj
+        obj_path = os.path.join(render_result_path, 'obj', seq_name)
+        if not os.path.exists(obj_path):
+            os.makedirs(obj_path)
+        self.save_obj(pred_verts_root[0], smpl_neutral.faces, osp.join(obj_path, f'{img_id:05d}.obj'))
+        
+
+    
+    def save_obj(self, v, f=None, file_name=''):
+        obj_file = open(file_name, 'w')
+        for i in range(len(v)):
+            obj_file.write('v ' + str(v[i][0]) + ' ' + str(v[i][1]) + ' ' + str(v[i][2]) + '\n')
+        if f is not None:
+            for i in range(len(f)):
+                obj_file.write('f ' + str(f[i][0]+1) + '/' + str(f[i][0]+1) + ' ' + str(f[i][1]+1) + '/' + str(f[i][1]+1) + ' ' + str(f[i][2]+1) + '/' + str(f[i][2]+1) + '\n')
+        obj_file.close()
+
+
+    def save_results(self, vts, cam_trans, images_lr, images_hr, p_id, name, bbox, prefix=None): # images_hr: [1. 448, 448, 3]
+        use_entire_img = True
+        vts = vts.clone().detach().cpu().numpy()
+        cam_trans = cam_trans.clone().detach().cpu().numpy()
+        images = images_lr.clone().detach()
+        images = images * torch.tensor([0.229, 0.224, 0.225], device=images.device).reshape(1,3,1,1)
+        images = images + torch.tensor([0.485, 0.456, 0.406], device=images.device).reshape(1,3,1,1)
+        images = np.transpose(images.cpu().numpy(), (0,2,3,1))
+        # hr image
+        images_hr = images_hr.clone().detach()
+        images_hr = images_hr * torch.tensor([0.229, 0.224, 0.225], device=images_hr.device).reshape(1,3,1,1)
+        images_hr = images_hr + torch.tensor([0.485, 0.456, 0.406], device=images_hr.device).reshape(1,3,1,1)
+        images_hr = np.transpose(images_hr.cpu().numpy(), (0,2,3,1))
+        for i in range(vts.shape[0]):
+            bbox = bbox.cpu().numpy()
+            seq_name = name[i].split('/')[-2] + "_" + str(int(p_id))
+            # Check whether this is the end of global step
+            if self.global_step == 0:
+                self.prev_global_step = self.global_step
+            else:
+                if self.prev_global_step != self.global_step:
+                    if use_entire_img is True:
+                        oriimg = cv2.imread(os.path.join(self.imgdir, name[i]))
+                        ori_h, ori_w = oriimg.shape[:2]
+                        ori_pred_cams = convert_crop_cam_to_orig_img(cam_trans, bbox, ori_w, ori_h)
+                        renderer = Renderer(resolution=(ori_w, ori_h), orig_img=True, wireframe=False)
+                        rendered_image = renderer.render(oriimg, vts[i], ori_pred_cams[i], color=np.array([254,189,248])/255, mesh_filename='demo.obj')
+                        bbox_for_crop = [max(0, int(bbox[0][1]-(bbox[0][2]*1.3/2))), int(bbox[0][1]+(bbox[0][2]*1.3/2)), max(0, int(bbox[0][0]-(bbox[0][2]*1.3/2))), int(bbox[0][0]+(bbox[0][2]*1.3/2))]
+                        rendered_image = rendered_image[bbox_for_crop[0]:bbox_for_crop[1], bbox_for_crop[2]:bbox_for_crop[3], :]
+
+                        if not os.path.exists(os.path.join(self.exppath, 'image', seq_name)):
+                            os.makedirs(os.path.join(self.exppath, 'image', seq_name), exist_ok=True)
+                            self.seq_count[seq_name] = 0
+
+                        # Front view mesh
+                        try:
+                            cv2.imwrite(osp.join(self.exppath, 'image', seq_name, f'{prefix}_{self.seq_count[seq_name]+i}.png'), rendered_image)
+                        except:
+                            import pdb; pdb.set_trace()
+
+                        # Side view mesh
+                        white_background = 255 * np.ones((ori_h,ori_w,3), np.uint8)
+                        side_view_rendered_image = renderer.render(white_background, vts[i], ori_pred_cams[i], color=np.array([254,189,248])/255, mesh_filename='demo.obj', angle=-90, axis=[0,1,0])
+                        side_view_rendered_image = side_view_rendered_image[bbox_for_crop[0]:bbox_for_crop[1], bbox_for_crop[2]:bbox_for_crop[3], :]
+                        cv2.imwrite(osp.join(self.exppath, 'image', seq_name, f'{prefix}_{self.seq_count[seq_name]+i}_side.png'), side_view_rendered_image)
+
+                        # Save obj file
+                        save_obj(vts[i]*1000, smpl_neutral.face, osp.join(self.exppath, 'image', seq_name, f'{prefix}_{self.seq_count[seq_name]+i}.obj'))
+
+                    self.seq_count[seq_name] += 1
+
+
+
 
 
 if __name__ == '__main__':
